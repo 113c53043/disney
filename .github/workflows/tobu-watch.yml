@@ -2,8 +2,8 @@ name: Tobu Bus 7AM Watch
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
-      timezone: "Asia/Taipei"
+    # UTC，每 5 分鐘；分鐘刻意避開 :00
+    - cron: "2-57/5 * * * *"
 
   workflow_dispatch:
 
