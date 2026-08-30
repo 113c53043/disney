@@ -1,10 +1,6 @@
 name: Tobu Bus 7AM Watch
 
 on:
-  schedule:
-    # UTC，每 5 分鐘；分鐘刻意避開 :00
-    - cron: "2-57/5 * * * *"
-
   workflow_dispatch:
 
 permissions:
@@ -21,10 +17,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: "pip"
@@ -40,9 +36,9 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: python check_tobu.py
 
-      - name: Upload debug screenshot
-        if: always()
-        uses: actions/upload-artifact@v4
+      - name: Upload debug screenshot on failure
+        if: failure()
+        uses: actions/upload-artifact@v6
         with:
           name: tobu-bus-debug-${{ github.run_id }}
           path: debug/
