@@ -91,8 +91,17 @@ def notify_discord(message: str) -> bool:
     if not webhook:
         return False
 
-    http_post_json(webhook, {"content": message})
-    log("已送出 Discord 通知。")
+    # 空位出現時直接 @everyone，讓 Discord 觸發提及通知。
+    # allowed_mentions 明確允許解析 @everyone。
+    payload = {
+        "content": f"@everyone {message}",
+        "allowed_mentions": {
+            "parse": ["everyone"]
+        }
+    }
+
+    http_post_json(webhook, payload)
+    log("已送出 Discord @everyone 通知。")
     return True
 
 
