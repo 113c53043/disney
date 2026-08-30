@@ -683,6 +683,34 @@ async def locate_target_card(page) -> dict | None:
 
 
 async def run_check() -> int:
+    # Manual end-to-end Discord test mode.
+    # This uses the SAME notify_discord() function as a real vacancy alert.
+    if os.getenv("TEST_DISCORD", "").strip().lower() in {"1", "true", "yes", "on"}:
+        log("TEST_DISCORD 已啟用，直接測試正式 Discord 通知管線。")
+
+        message = (
+            "✅ Tobu Bus Watch 正式通知管線測試成功！\n\n"
+            "這則訊息是由正式 check_tobu.py 的 notify_discord() 發送。\n"
+            "之後若 2026/09/10 ホテル 7:00発 出現至少 2 席，"
+            "會走同一條通知流程。"
+        )
+
+        try:
+            sent = send_notifications(message)
+        except Exception as exc:
+            log(f"Discord 測試失敗：{exc}")
+            return 1
+
+        if sent < 1:
+            log("Discord 測試失敗：沒有任何外部通知成功。")
+            return 1
+
+        write_github_summary(
+            "## ✅ Discord 正式通知測試成功\n\n"
+            "已透過正式 `check_tobu.py` 通知函式送出測試訊息。\n"
+        )
+        return 0
+
     now = datetime.now(TAIPEI)
 
     if not monitoring_is_active(now):
