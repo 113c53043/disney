@@ -2,16 +2,9 @@ name: Tobu Bus 7AM Watch
 
 on:
   schedule:
-    # Taiwan time. Offset the runs from :00 to reduce peak-hour scheduling delays.
-    # 2026/08/30 - 2026/08/31
-    - cron: "3-58/5 * 30-31 8 *"
+    - cron: "*/5 * * * *"
       timezone: "Asia/Taipei"
 
-    # 2026/09/01 - 2026/09/09
-    - cron: "3-58/5 * 1-9 9 *"
-      timezone: "Asia/Taipei"
-
-  # Lets you press "Run workflow" manually for testing.
   workflow_dispatch:
 
 permissions:
@@ -45,8 +38,6 @@ jobs:
       - name: Check 2026-09-10 Hotel 7:00 bus
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python check_tobu.py
 
       - name: Upload debug screenshot
