@@ -1,4 +1,4 @@
-name: Test Discord Notification
+name: Test Discord Everyone
 
 on:
   workflow_dispatch:
@@ -8,12 +8,15 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Send Discord test message
+      - name: Send Discord @everyone test
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
-          test -n "$DISCORD_WEBHOOK_URL"
           curl -f \
             -H "Content-Type: application/json" \
-            -d '{"content":"✅ 東武巴士空位監控：Discord 通知測試成功！"}' \
+            -d '{
+              "content":"@everyone 🚨 東武接駁車有位置了！【測試通知】",
+              "allowed_mentions":{"parse":["everyone"]}
+            }' \
             "$DISCORD_WEBHOOK_URL"
+            
