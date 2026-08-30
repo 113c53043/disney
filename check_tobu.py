@@ -349,149 +349,112 @@ async def click_search(page) -> None:
 
 async def locate_target_card(page) -> dict | None:
     """
-    Locate ONLY the 2026/09/10 Hotel 7:00 departure card.
+    Robust parser for the visible search-result text.
 
-    Important:
-    The official page may render Japanese full-width characters, e.g.
+    Why this version:
+    The site visually shows entries such as:
+
         ホテル　７：００発
         残り０席
 
-    JavaScript NFKC normalization converts these to:
-        ホテル 7:00発
-        残り0席
+        ホテル　９：２０発
+        残り３席
 
-    We start from elements containing the 7:00 departure label and walk
-    upward until we reach the smallest ancestor that also contains its
-    own "残りN席" value. This avoids accidentally reading another
-    departure card's seat count.
+    Instead of depending on the site's DOM/card structure, read the rendered
+    BODY text, normalize Japanese full-width characters with NFKC, split the
+    result by each "ホテル H:MM発" heading, and read the seat count only from
+    the 7:00 section.
+
+    Therefore a later 9:20 entry with available seats can never be mistaken
+    for the 7:00 entry.
     """
-    result = await page.evaluate(
-        r"""
-        () => {
-            const normalize = (s) =>
-                (s || "")
-                    .normalize("NFKC")
-                    .replace(/\u3000/g, " ")
-                    .replace(/\u00a0/g, " ")
-                    .replace(/[ \t]+/g, " ")
-                    .replace(/\n\s+/g, "\n")
-                    .trim();
+    import unicodedata
 
-            // After NFKC normalization, full-width ７：００ becomes 7:00.
-            const departureRe = /ホテル\s*7\s*:\s*00\s*発/i;
-            const dateRe = /2026年\s*0?9月\s*10日/i;
-            const seatsRe = /残り\s*(\d+)\s*席/;
+    body_text = await page.locator("body").inner_text()
+    normalized = unicodedata.normalize("NFKC", body_text)
+    normalized = normalized.replace("\u3000", " ").replace("\u00a0", " ")
 
-            const all = Array.from(document.querySelectorAll("body *"));
+    # Normalize horizontal whitespace but preserve newlines for diagnostics.
+    normalized = re.sub(r"[ \t]+", " ", normalized)
 
-            // Prefer the smallest/leaf-like elements that mention 7:00.
-            const departureElements = all
-                .map((el) => ({
-                    el,
-                    text: normalize(el.innerText || el.textContent || "")
-                }))
-                .filter((x) => x.text && departureRe.test(x.text))
-                .sort((a, b) => a.text.length - b.text.length);
-
-            const candidates = [];
-
-            for (const item of departureElements) {
-                let node = item.el;
-
-                while (node && node !== document.body) {
-                    const text = normalize(
-                        node.innerText || node.textContent || ""
-                    );
-
-                    const seatMatch = text.match(seatsRe);
-
-                    if (departureRe.test(text) && seatMatch) {
-                        candidates.push({
-                            text,
-                            seats: Number(seatMatch[1]),
-                            hasDate: dateRe.test(text),
-                            tag: node.tagName,
-                            className:
-                                typeof node.className === "string"
-                                    ? node.className
-                                    : "",
-                            htmlLength: (node.outerHTML || "").length,
-                        });
-
-                        // This is the smallest ancestor of this starting
-                        // element containing both departure and seat count.
-                        break;
-                    }
-
-                    node = node.parentElement;
-                }
-            }
-
-            if (!candidates.length) {
-                // Return useful diagnostics so the Python log can show
-                // what schedules / seat strings were actually visible.
-                const departureTexts = all
-                    .map((el) =>
-                        normalize(el.innerText || el.textContent || "")
-                    )
-                    .filter((t) => /ホテル\s*\d+\s*:\s*\d+\s*発/i.test(t))
-                    .sort((a, b) => a.length - b.length)
-                    .slice(0, 20);
-
-                const seatTexts = all
-                    .map((el) =>
-                        normalize(el.innerText || el.textContent || "")
-                    )
-                    .filter((t) => /残り\s*\d+\s*席/.test(t))
-                    .sort((a, b) => a.length - b.length)
-                    .slice(0, 20);
-
-                return {
-                    notFound: true,
-                    departureTexts,
-                    seatTexts,
-                };
-            }
-
-            // Prefer a candidate that also contains the requested date.
-            // Then choose the smallest text block, which is normally the
-            // individual bus card rather than the whole result section.
-            candidates.sort((a, b) => {
-                if (a.hasDate !== b.hasDate) {
-                    return a.hasDate ? -1 : 1;
-                }
-                if (a.text.length !== b.text.length) {
-                    return a.text.length - b.text.length;
-                }
-                return a.htmlLength - b.htmlLength;
-            });
-
-            return candidates[0];
-        }
-        """
+    departure_re = re.compile(
+        r"ホテル\s*(\d{1,2})\s*:\s*(\d{2})\s*発",
+        re.IGNORECASE,
     )
+    seats_re = re.compile(r"残り\s*(\d+)\s*席")
 
-    if result and result.get("notFound"):
-        departure_texts = result.get("departureTexts", [])
-        seat_texts = result.get("seatTexts", [])
+    departures = list(departure_re.finditer(normalized))
 
-        log("找不到 7:00 目標卡片。以下是頁面實際辨識到的班次文字：")
-        if departure_texts:
-            for item in departure_texts[:10]:
-                log(f"  班次候選：{item[:300]}")
-        else:
-            log("  沒有辨識到任何「ホテル H:MM発」文字。")
-
-        log("頁面實際辨識到的剩餘座位文字：")
-        if seat_texts:
-            for item in seat_texts[:10]:
-                log(f"  座位候選：{item[:300]}")
-        else:
-            log("  沒有辨識到任何「残りN席」文字。")
-
+    if not departures:
+        log("搜尋結果頁面中完全找不到任何「ホテル H:MM発」。")
+        log("頁面可見文字前 5000 字：\n" + normalized[:5000])
         return None
 
-    return result
+    parsed = []
+
+    for index, dep in enumerate(departures):
+        hour = int(dep.group(1))
+        minute = int(dep.group(2))
+
+        # This departure's text ends immediately before the next departure.
+        segment_start = dep.start()
+        if index + 1 < len(departures):
+            segment_end = departures[index + 1].start()
+        else:
+            # The footer can be long; 3000 characters is more than enough
+            # for a single bus result while avoiding unrelated text.
+            segment_end = min(len(normalized), dep.start() + 3000)
+
+        segment = normalized[segment_start:segment_end]
+        seat_match = seats_re.search(segment)
+
+        parsed.append(
+            {
+                "hour": hour,
+                "minute": minute,
+                "seats": int(seat_match.group(1)) if seat_match else None,
+                "text": segment.strip(),
+            }
+        )
+
+    # Always print what GitHub actually saw. This makes future debugging easy.
+    log("GitHub 搜尋結果辨識到的班次：")
+    for item in parsed:
+        seat_text = (
+            f"残り{item['seats']}席"
+            if item["seats"] is not None
+            else "找不到座位數"
+        )
+        log(
+            f"  ホテル {item['hour']}:{item['minute']:02d}発 -> {seat_text}"
+        )
+
+    target = next(
+        (
+            item
+            for item in parsed
+            if item["hour"] == 7 and item["minute"] == 0
+        ),
+        None,
+    )
+
+    if target is None:
+        log("有搜尋結果，但其中沒有「ホテル 7:00発」。")
+        return None
+
+    if target["seats"] is None:
+        log("找到「ホテル 7:00発」，但在它自己的區段內找不到「残りN席」。")
+        log("7:00 區段內容：\n" + target["text"][:2000])
+        return None
+
+    # Keep the same return shape expected by run_check().
+    return {
+        "text": target["text"],
+        "seats": target["seats"],
+        "tag": "BODY_TEXT_SECTION",
+        "className": "",
+        "htmlLength": len(target["text"]),
+    }
 
 
 async def run_check() -> int:
