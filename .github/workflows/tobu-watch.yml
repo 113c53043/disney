@@ -2,6 +2,12 @@ name: Tobu Bus 7AM Watch
 
 on:
   workflow_dispatch:
+    inputs:
+      test_discord:
+        description: "只測試 Discord 通知，不查巴士"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -17,10 +23,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: "pip"
@@ -31,14 +37,15 @@ jobs:
       - name: Install Chromium
         run: python -m playwright install --with-deps chromium
 
-      - name: Check 2026-09-10 Hotel 7:00 bus
+      - name: Run Tobu Bus Watch
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          TEST_DISCORD: ${{ inputs.test_discord }}
         run: python check_tobu.py
 
       - name: Upload debug screenshot on failure
         if: failure()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         with:
           name: tobu-bus-debug-${{ github.run_id }}
           path: debug/
