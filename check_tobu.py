@@ -349,111 +349,327 @@ async def click_search(page) -> None:
 
 async def locate_target_card(page) -> dict | None:
     """
-    Robust parser for the visible search-result text.
+    Find the 7:00 departure and its OWN seat badge by visual page position.
 
-    Why this version:
-    The site visually shows entries such as:
+    Why:
+    The site's DOM/text order does not necessarily match the visual card order.
+    Reading BODY text sequentially can therefore pair:
 
-        ホテル　７：００発
-        残り０席
+        7:00 -> 残り3席   (WRONG; 3 seats actually belongs to 9:20)
 
-        ホテル　９：２０発
-        残り３席
+    This version uses rendered element coordinates:
+      1. Find every visible "ホテル H:MM発" heading.
+      2. Find every visible exact "残りN席" badge.
+      3. Assign each seat badge to the departure heading that is visually
+         closest in the vertical direction.
+      4. Read ONLY the badge assigned to 7:00.
 
-    Instead of depending on the site's DOM/card structure, read the rendered
-    BODY text, normalize Japanese full-width characters with NFKC, split the
-    result by each "ホテル H:MM発" heading, and read the seat count only from
-    the 7:00 section.
-
-    Therefore a later 9:20 entry with available seats can never be mistaken
-    for the 7:00 entry.
+    Fail-safe:
+    If pairing is ambiguous or too far apart, return None rather than
+    triggering a false vacancy alert.
     """
-    import unicodedata
 
-    body_text = await page.locator("body").inner_text()
-    normalized = unicodedata.normalize("NFKC", body_text)
-    normalized = normalized.replace("\u3000", " ").replace("\u00a0", " ")
+    result = await page.evaluate(
+        r"""
+        () => {
+            const normalize = (s) =>
+                (s || "")
+                    .normalize("NFKC")
+                    .replace(/\u3000/g, " ")
+                    .replace(/\u00a0/g, " ")
+                    .replace(/[ \t]+/g, " ")
+                    .trim();
 
-    # Normalize horizontal whitespace but preserve newlines for diagnostics.
-    normalized = re.sub(r"[ \t]+", " ", normalized)
+            const departureRe =
+                /^ホテル\s*(\d{1,2})\s*:\s*(\d{2})\s*発$/i;
 
-    departure_re = re.compile(
-        r"ホテル\s*(\d{1,2})\s*:\s*(\d{2})\s*発",
-        re.IGNORECASE,
-    )
-    seats_re = re.compile(r"残り\s*(\d+)\s*席")
+            const seatsRe =
+                /^残り\s*(\d+)\s*席$/;
 
-    departures = list(departure_re.finditer(normalized))
+            const visible = (el) => {
+                const r = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
 
-    if not departures:
-        log("搜尋結果頁面中完全找不到任何「ホテル H:MM発」。")
-        log("頁面可見文字前 5000 字：\n" + normalized[:5000])
-        return None
+                return (
+                    r.width > 0 &&
+                    r.height > 0 &&
+                    style.display !== "none" &&
+                    style.visibility !== "hidden" &&
+                    Number(style.opacity || "1") > 0
+                );
+            };
 
-    parsed = []
+            const rectInfo = (el) => {
+                const r = el.getBoundingClientRect();
 
-    for index, dep in enumerate(departures):
-        hour = int(dep.group(1))
-        minute = int(dep.group(2))
+                return {
+                    left: r.left,
+                    right: r.right,
+                    top: r.top,
+                    bottom: r.bottom,
+                    width: r.width,
+                    height: r.height,
+                    cx: r.left + r.width / 2,
+                    cy: r.top + r.height / 2,
+                };
+            };
 
-        # This departure's text ends immediately before the next departure.
-        segment_start = dep.start()
-        if index + 1 < len(departures):
-            segment_end = departures[index + 1].start()
-        else:
-            # The footer can be long; 3000 characters is more than enough
-            # for a single bus result while avoiding unrelated text.
-            segment_end = min(len(normalized), dep.start() + 3000)
+            const all = Array.from(document.querySelectorAll("body *"));
 
-        segment = normalized[segment_start:segment_end]
-        seat_match = seats_re.search(segment)
+            /*
+             * Use exact-text elements only.
+             * This intentionally excludes large parent containers whose
+             * innerText contains an entire result card or multiple cards.
+             */
+            let departures = [];
 
-        parsed.append(
-            {
-                "hour": hour,
-                "minute": minute,
-                "seats": int(seat_match.group(1)) if seat_match else None,
-                "text": segment.strip(),
+            for (const el of all) {
+                if (!visible(el)) continue;
+
+                const text = normalize(el.innerText || el.textContent || "");
+                const m = text.match(departureRe);
+
+                if (!m) continue;
+
+                departures.push({
+                    hour: Number(m[1]),
+                    minute: Number(m[2]),
+                    text,
+                    rect: rectInfo(el),
+                });
             }
-        )
 
-    # Always print what GitHub actually saw. This makes future debugging easy.
-    log("GitHub 搜尋結果辨識到的班次：")
-    for item in parsed:
-        seat_text = (
-            f"残り{item['seats']}席"
-            if item["seats"] is not None
-            else "找不到座位數"
-        )
-        log(
-            f"  ホテル {item['hour']}:{item['minute']:02d}発 -> {seat_text}"
-        )
+            let seats = [];
 
-    target = next(
-        (
-            item
-            for item in parsed
-            if item["hour"] == 7 and item["minute"] == 0
-        ),
-        None,
+            for (const el of all) {
+                if (!visible(el)) continue;
+
+                const text = normalize(el.innerText || el.textContent || "");
+                const m = text.match(seatsRe);
+
+                if (!m) continue;
+
+                seats.push({
+                    seats: Number(m[1]),
+                    text,
+                    rect: rectInfo(el),
+                });
+            }
+
+            /*
+             * Some sites render the same exact text in nested inline tags.
+             * Deduplicate visually overlapping candidates.
+             */
+            const dedupeByPosition = (items, keyFn) => {
+                const out = [];
+
+                for (const item of items) {
+                    const key = keyFn(item);
+
+                    const duplicate = out.some((x) => {
+                        if (keyFn(x) !== key) return false;
+
+                        return (
+                            Math.abs(x.rect.cx - item.rect.cx) < 3 &&
+                            Math.abs(x.rect.cy - item.rect.cy) < 3
+                        );
+                    });
+
+                    if (!duplicate) out.push(item);
+                }
+
+                return out;
+            };
+
+            departures = dedupeByPosition(
+                departures,
+                (x) => `${x.hour}:${x.minute}`
+            );
+
+            seats = dedupeByPosition(
+                seats,
+                (x) => String(x.seats)
+            );
+
+            if (!departures.length) {
+                return {
+                    ok: false,
+                    reason: "no_departures",
+                    departures: [],
+                    seats,
+                };
+            }
+
+            const target = departures.find(
+                (x) => x.hour === 7 && x.minute === 0
+            );
+
+            if (!target) {
+                return {
+                    ok: false,
+                    reason: "no_7am",
+                    departures,
+                    seats,
+                };
+            }
+
+            if (!seats.length) {
+                return {
+                    ok: false,
+                    reason: "no_seat_badges",
+                    departures,
+                    seats: [],
+                };
+            }
+
+            /*
+             * Pair every seat badge with the departure whose heading is
+             * vertically nearest to it.
+             *
+             * On this page, departure title and "残りN席" are on the same
+             * horizontal row of each card, so this is much safer than DOM order.
+             */
+            const assignments = seats.map((seat) => {
+                const ranked = departures
+                    .map((dep) => ({
+                        dep,
+                        dy: Math.abs(dep.rect.cy - seat.rect.cy),
+                    }))
+                    .sort((a, b) => a.dy - b.dy);
+
+                return {
+                    seat,
+                    nearest: ranked[0],
+                    second: ranked[1] || null,
+                };
+            });
+
+            const targetAssignments = assignments
+                .filter(
+                    (a) =>
+                        a.nearest.dep.hour === 7 &&
+                        a.nearest.dep.minute === 0
+                )
+                .sort((a, b) => a.nearest.dy - b.nearest.dy);
+
+            if (!targetAssignments.length) {
+                return {
+                    ok: false,
+                    reason: "no_seat_assigned_to_7am",
+                    departures,
+                    seats,
+                    assignments,
+                };
+            }
+
+            const best = targetAssignments[0];
+
+            /*
+             * Safety checks:
+             * - Seat badge should be close to the 7:00 heading vertically.
+             * - If another departure is almost equally close, pairing is
+             *   ambiguous; fail instead of notifying incorrectly.
+             */
+            const MAX_VERTICAL_DISTANCE = 120;
+
+            if (best.nearest.dy > MAX_VERTICAL_DISTANCE) {
+                return {
+                    ok: false,
+                    reason: "seat_too_far_from_7am",
+                    departures,
+                    seats,
+                    assignments,
+                };
+            }
+
+            if (
+                best.second &&
+                Math.abs(best.second.dy - best.nearest.dy) < 20
+            ) {
+                return {
+                    ok: false,
+                    reason: "ambiguous_pairing",
+                    departures,
+                    seats,
+                    assignments,
+                };
+            }
+
+            return {
+                ok: true,
+                seats: best.seat.seats,
+                text:
+                    `ホテル 7:00発 -> 残り${best.seat.seats}席 ` +
+                    `(vertical distance=${best.nearest.dy.toFixed(1)}px)`,
+                departures,
+                seatBadges: seats,
+                assignments,
+            };
+        }
+        """
     )
 
-    if target is None:
-        log("有搜尋結果，但其中沒有「ホテル 7:00発」。")
+    # Diagnostic logging: always show what GitHub visually detected.
+    departures = result.get("departures", []) if result else []
+    seat_badges = (
+        result.get("seatBadges", result.get("seats", []))
+        if result
+        else []
+    )
+
+    log("GitHub 畫面辨識到的班次：")
+    if departures:
+        for dep in departures:
+            log(
+                "  ホテル "
+                f"{dep['hour']}:{dep['minute']:02d}発 "
+                f"(y={dep['rect']['cy']:.1f})"
+            )
+    else:
+        log("  無")
+
+    log("GitHub 畫面辨識到的座位標籤：")
+    if isinstance(seat_badges, list) and seat_badges:
+        for seat in seat_badges:
+            log(
+                f"  残り{seat['seats']}席 "
+                f"(y={seat['rect']['cy']:.1f})"
+            )
+    else:
+        log("  無")
+
+    if not result or not result.get("ok"):
+        reason = result.get("reason", "unknown") if result else "no_result"
+        log(f"7:00 班次座位配對失敗：{reason}")
+
+        assignments = result.get("assignments", []) if result else []
+
+        if assignments:
+            log("座位標籤與班次的視覺配對診斷：")
+            for a in assignments:
+                seat = a["seat"]
+                nearest = a["nearest"]
+                dep = nearest["dep"]
+
+                log(
+                    f"  残り{seat['seats']}席 -> "
+                    f"ホテル {dep['hour']}:{dep['minute']:02d}発 "
+                    f"(dy={nearest['dy']:.1f}px)"
+                )
+
         return None
 
-    if target["seats"] is None:
-        log("找到「ホテル 7:00発」，但在它自己的區段內找不到「残りN席」。")
-        log("7:00 區段內容：\n" + target["text"][:2000])
-        return None
+    log(
+        "7:00 視覺配對成功："
+        f"ホテル 7:00発 -> 残り{result['seats']}席"
+    )
 
-    # Keep the same return shape expected by run_check().
     return {
-        "text": target["text"],
-        "seats": target["seats"],
-        "tag": "BODY_TEXT_SECTION",
+        "text": result["text"],
+        "seats": int(result["seats"]),
+        "tag": "VISUAL_POSITION_MATCH",
         "className": "",
-        "htmlLength": len(target["text"]),
+        "htmlLength": len(result["text"]),
     }
 
 
