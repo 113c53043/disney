@@ -39,7 +39,7 @@ TARGET_DAY = 10
 TARGET_PASSENGERS = 2
 
 TARGET_DEPARTURE_RE = re.compile(
-    r"ホテル\s*7\s*[：:]\s*00\s*発",
+    r"ホテル\s*[7７]\s*[：:]\s*[0０][0０]\s*発",
     re.IGNORECASE,
 )
 TARGET_DATE_RE = re.compile(
@@ -349,51 +349,67 @@ async def click_search(page) -> None:
 
 async def locate_target_card(page) -> dict | None:
     """
-    Find the smallest DOM ancestor that contains ALL of:
-      - ホテル 7:00発
-      - 2026年09月10日
-      - 残りN席
+    Locate ONLY the 2026/09/10 Hotel 7:00 departure card.
 
-    Choosing the smallest ancestor prevents a different bus card's seat count
-    from being mistaken for the 7:00 bus.
+    Important:
+    The official page may render Japanese full-width characters, e.g.
+        ホテル　７：００発
+        残り０席
+
+    JavaScript NFKC normalization converts these to:
+        ホテル 7:00発
+        残り0席
+
+    We start from elements containing the 7:00 departure label and walk
+    upward until we reach the smallest ancestor that also contains its
+    own "残りN席" value. This avoids accidentally reading another
+    departure card's seat count.
     """
     result = await page.evaluate(
         r"""
         () => {
-            const departureRe = /ホテル\s*7\s*[：:]\s*00\s*発/i;
-            const dateRe = /2026年\s*0?9月\s*10日/i;
-            const seatsRe = /残り\s*(\d+)\s*席/;
-
             const normalize = (s) =>
                 (s || "")
+                    .normalize("NFKC")
+                    .replace(/\u3000/g, " ")
                     .replace(/\u00a0/g, " ")
                     .replace(/[ \t]+/g, " ")
                     .replace(/\n\s+/g, "\n")
                     .trim();
 
+            // After NFKC normalization, full-width ７：００ becomes 7:00.
+            const departureRe = /ホテル\s*7\s*:\s*00\s*発/i;
+            const dateRe = /2026年\s*0?9月\s*10日/i;
+            const seatsRe = /残り\s*(\d+)\s*席/;
+
             const all = Array.from(document.querySelectorAll("body *"));
-            const departureElements = all.filter((el) => {
-                const ownText = normalize(el.innerText || el.textContent || "");
-                return ownText && departureRe.test(ownText);
-            });
+
+            // Prefer the smallest/leaf-like elements that mention 7:00.
+            const departureElements = all
+                .map((el) => ({
+                    el,
+                    text: normalize(el.innerText || el.textContent || "")
+                }))
+                .filter((x) => x.text && departureRe.test(x.text))
+                .sort((a, b) => a.text.length - b.text.length);
 
             const candidates = [];
 
-            for (const el of departureElements) {
-                let node = el;
+            for (const item of departureElements) {
+                let node = item.el;
 
                 while (node && node !== document.body) {
-                    const text = normalize(node.innerText || node.textContent || "");
+                    const text = normalize(
+                        node.innerText || node.textContent || ""
+                    );
+
                     const seatMatch = text.match(seatsRe);
 
-                    if (
-                        departureRe.test(text) &&
-                        dateRe.test(text) &&
-                        seatMatch
-                    ) {
+                    if (departureRe.test(text) && seatMatch) {
                         candidates.push({
                             text,
                             seats: Number(seatMatch[1]),
+                            hasDate: dateRe.test(text),
                             tag: node.tagName,
                             className:
                                 typeof node.className === "string"
@@ -401,6 +417,9 @@ async def locate_target_card(page) -> dict | None:
                                     : "",
                             htmlLength: (node.outerHTML || "").length,
                         });
+
+                        // This is the smallest ancestor of this starting
+                        // element containing both departure and seat count.
                         break;
                     }
 
@@ -408,13 +427,69 @@ async def locate_target_card(page) -> dict | None:
                 }
             }
 
-            if (!candidates.length) return null;
+            if (!candidates.length) {
+                // Return useful diagnostics so the Python log can show
+                // what schedules / seat strings were actually visible.
+                const departureTexts = all
+                    .map((el) =>
+                        normalize(el.innerText || el.textContent || "")
+                    )
+                    .filter((t) => /ホテル\s*\d+\s*:\s*\d+\s*発/i.test(t))
+                    .sort((a, b) => a.length - b.length)
+                    .slice(0, 20);
 
-            candidates.sort((a, b) => a.text.length - b.text.length);
+                const seatTexts = all
+                    .map((el) =>
+                        normalize(el.innerText || el.textContent || "")
+                    )
+                    .filter((t) => /残り\s*\d+\s*席/.test(t))
+                    .sort((a, b) => a.length - b.length)
+                    .slice(0, 20);
+
+                return {
+                    notFound: true,
+                    departureTexts,
+                    seatTexts,
+                };
+            }
+
+            // Prefer a candidate that also contains the requested date.
+            // Then choose the smallest text block, which is normally the
+            // individual bus card rather than the whole result section.
+            candidates.sort((a, b) => {
+                if (a.hasDate !== b.hasDate) {
+                    return a.hasDate ? -1 : 1;
+                }
+                if (a.text.length !== b.text.length) {
+                    return a.text.length - b.text.length;
+                }
+                return a.htmlLength - b.htmlLength;
+            });
+
             return candidates[0];
         }
         """
     )
+
+    if result and result.get("notFound"):
+        departure_texts = result.get("departureTexts", [])
+        seat_texts = result.get("seatTexts", [])
+
+        log("找不到 7:00 目標卡片。以下是頁面實際辨識到的班次文字：")
+        if departure_texts:
+            for item in departure_texts[:10]:
+                log(f"  班次候選：{item[:300]}")
+        else:
+            log("  沒有辨識到任何「ホテル H:MM発」文字。")
+
+        log("頁面實際辨識到的剩餘座位文字：")
+        if seat_texts:
+            for item in seat_texts[:10]:
+                log(f"  座位候選：{item[:300]}")
+        else:
+            log("  沒有辨識到任何「残りN席」文字。")
+
+        return None
 
     return result
 
