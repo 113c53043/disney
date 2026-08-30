@@ -1,0 +1,59 @@
+name: Tobu Bus 7AM Watch
+
+on:
+  schedule:
+    # Taiwan time. Offset the runs from :00 to reduce peak-hour scheduling delays.
+    # 2026/08/30 - 2026/08/31
+    - cron: "3-58/5 * 30-31 8 *"
+      timezone: "Asia/Taipei"
+
+    # 2026/09/01 - 2026/09/09
+    - cron: "3-58/5 * 1-9 9 *"
+      timezone: "Asia/Taipei"
+
+  # Lets you press "Run workflow" manually for testing.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tobu-bus-7am-watch
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Check 2026-09-10 Hotel 7:00 bus
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python check_tobu.py
+
+      - name: Upload debug screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tobu-bus-debug-${{ github.run_id }}
+          path: debug/
+          if-no-files-found: ignore
+          retention-days: 3
